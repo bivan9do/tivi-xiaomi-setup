@@ -1,0 +1,70 @@
+package com.gathin.tvhome;
+
+import android.view.KeyEvent;
+import java.util.Map;
+import org.junit.Test;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+public class RemoteKeysTest {
+    private static Map<Integer, String> parse(String... entries) {
+        // Key names resolved by a stand-in: android.view.KeyEvent isn't available in JVM tests.
+        return RemoteKeys.parseAppKeys(java.util.Arrays.asList(entries),
+                name -> name.equals("KEYCODE_BUTTON_3") ? 190 : 0);
+    }
+
+    @Test public void keyNamesWorkLikeNumbers() {
+        Map<Integer, String> keys = parse("KEYCODE_BUTTON_3:com.google.android.youtube.tv", "KEYCODE_NOT_A_KEY:a.b");
+        assertEquals(1, keys.size());
+        assertEquals("com.google.android.youtube.tv", keys.get(190));
+    }
+
+    @Test public void keycodeAndPackage() {
+        Map<Integer, String> keys = parse(
+                "190:com.google.android.youtube.tv", " 193 : com.netflix.ninja ");
+        assertEquals(2, keys.size());
+        assertEquals("com.google.android.youtube.tv", keys.get(190));
+        assertEquals("com.netflix.ninja", keys.get(193));
+    }
+
+    @Test public void onlyChannelUpAndDownAreChannelKeys() {
+        assertTrue(RemoteKeys.isChannelKey(KeyEvent.KEYCODE_CHANNEL_UP));
+        assertTrue(RemoteKeys.isChannelKey(KeyEvent.KEYCODE_CHANNEL_DOWN));
+        assertFalse(RemoteKeys.isChannelKey(KeyEvent.KEYCODE_DPAD_UP));
+        assertFalse(RemoteKeys.isChannelKey(KeyEvent.KEYCODE_TV));
+    }
+
+    @Test public void badEntriesAreSkipped() {
+        Map<Integer, String> keys = parse(
+                "com.google.android.youtube.tv", "youtube:com.google.android.youtube.tv", "190:", "");
+        assertTrue(keys.isEmpty());
+    }
+
+    @Test public void theLastEntryForAKeycodeWins() {
+        Map<Integer, String> keys = parse("190:a.b", "190:c.d");
+        assertEquals("c.d", keys.get(190));
+    }
+
+    @Test public void activityTargetsKeepTheirSlash() {
+        Map<Integer, String> keys = parse("191:io.github.app/.QuickActivity");
+        assertEquals("io.github.app/.QuickActivity", keys.get(191));
+        assertTrue(RemoteKeys.isActivityTarget(keys.get(191)));
+        assertFalse(RemoteKeys.isActivityTarget("com.netflix.ninja"));
+        assertFalse(RemoteKeys.isActivityTarget("/.Activity"));
+    }
+
+    @Test public void bothServicesCopiesOfOnePressLaunchOnce() {
+        RemoteKeys.Presses presses = new RemoteKeys.Presses();
+        assertTrue(presses.firstCopy("3:190:0", 1000));
+        assertFalse(presses.firstCopy("3:190:0", 1000));
+    }
+
+    @Test public void eachNewPressLaunches() {
+        RemoteKeys.Presses presses = new RemoteKeys.Presses();
+        assertTrue(presses.firstCopy("3:190:0", 1000));
+        assertTrue(presses.firstCopy("3:190:0", 1400));
+        assertTrue(presses.firstCopy("3:4062:0", 1400));
+        assertTrue(presses.firstCopy("3:190:0", 1400));
+    }
+}

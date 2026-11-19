@@ -1,0 +1,182 @@
+package theme
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/kienmai160598/freeTV/apps/tvctl/internal/tv"
+	"github.com/kienmai160598/freeTV/apps/tvctl/internal/tv/tvtest"
+)
+
+func writeTheme(t *testing.T, files map[string]string) string {
+	t.Helper()
+	folder := filepath.Join(t.TempDir(), "aurora")
+	for name, content := range files {
+		path := filepath.Join(folder, name)
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return folder
+}
+
+func TestApplyPushesTheThemeAndRestartsHome(t *testing.T) {
+	folder := writeTheme(t, map[string]string{
+		"config.json":          `{"background_color": "#6750A4"}`,
+		"wallpaper.jpg":        "jpg",
+		"wallpapers/one.png":   "png",
+		"wallpapers/notes.txt": "not an image",
+		"wallpapers/two.WEBP":  "webp",
+	})
+	dev := &tvtest.Fake{Answer: func(string) (string, error) { return "applied\n", nil }}
+	var out bytes.Buffer
+	if err := Apply(dev, folder, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := []string{
+		remoteConfig,
+		remoteWallpaper,
+		remoteWallpapers + "/one.png",
+		remoteWallpapers + "/two.WEBP",
+	}
+
+	for _, remote := range expected {
+		if _, ok := dev.Pushed[remote]; !ok {
+			t.Errorf("%s was not pushed", remote)
+		}
+	}
+
+	if len(dev.Pushed) != 4 {
+		t.Errorf("pushed %v", dev.Pushed)
+	}
+
+	last := dev.Commands[len(dev.Commands)-1]
+	if !strings.Contains(last, "theme_revision") || !strings.Contains(last, "am force-stop") {
+		t.Errorf("last command %q", last)
+	}
+
+	if !strings.Contains(out.String(), "Theme aurora is on the TV") {
+		t.Errorf("output %q", out.String())
+	}
+}
+
+func TestApplyRemovesAWallpaperTheThemeDoesNotHave(t *testing.T) {
+	dev := &tvtest.Fake{}
+	folder := writeTheme(t, map[string]string{"config.json": "{}"})
+	if err := Apply(dev, folder, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, command := range dev.Commands {
+		found = found || command == "rm -f "+remoteWallpaper
+	}
+
+	if !found {
+		t.Errorf("commands %v", dev.Commands)
+	}
+}
+
+func TestBadThemesReachNothing(t *testing.T) {
+	cases := map[string]map[string]string{
+		"no config":    {"wallpaper.jpg": "jpg"},
+		"invalid json": {"config.json": "{nope"},
+		"unsafe name":  {"config.json": "{}", "wallpapers/a b;reboot.jpg": "jpg"},
+	}
+
+	for name, files := range cases {
+		t.Run(name, func(t *testing.T) {
+			dev := &tvtest.Fake{}
+			if err := Apply(dev, writeTheme(t, files), &bytes.Buffer{}); err == nil {
+				t.Fatal("expected an error")
+			}
+			if len(dev.Commands) != 0 || len(dev.Pushed) != 0 {
+				t.Errorf("reached the TV: %v %v", dev.Commands, dev.Pushed)
+			}
+		})
+	}
+}
+
+func TestShippedThemesAreValid(t *testing.T) {
+	folders, _ := filepath.Glob("../../../../packages/themes/*/config.json")
+	if len(folders) == 0 {
+		t.Fatal("no themes found")
+	}
+
+	for _, config := range folders {
+		folder := filepath.Dir(config)
+		if _, err := wallpaperFiles(folder); err != nil {
+			t.Errorf("%s: %v", folder, err)
+		}
+		if err := Apply(&tvtest.Fake{}, folder, &bytes.Buffer{}); err != nil {
+			t.Errorf("%s: %v", folder, err)
+		}
+	}
+}
+
+func TestShippedModelConfigsAreValid(t *testing.T) {
+	configs, _ := filepath.Glob("../../../../packages/debloat-lists/*/config.json")
+	if len(configs) == 0 {
+		t.Fatal("no model configs found")
+	}
+
+	for _, config := range configs {
+		folder := filepath.Dir(config)
+		if err := Apply(&tvtest.Fake{}, folder, &bytes.Buffer{}); err != nil {
+			t.Errorf("%s: %v", folder, err)
+		}
+	}
+}
+
+func TestApplyAcceptsAConfigSavedWithABOM(t *testing.T) {
+	dev := &tvtest.Fake{}
+	folder := writeTheme(t, map[string]string{"config.json": "\xef\xbb\xbf{\"columns\": 6}"})
+	if err := Apply(dev, folder, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := dev.Pushed[remoteConfig]; !ok {
+		t.Errorf("pushed %v", dev.Pushed)
+	}
+}
+
+func TestResetRemovesEveryThemeFileIncludingTheCollection(t *testing.T) {
+	dev := &tvtest.Fake{Answer: func(string) (string, error) { return "reset\n", nil }}
+	if err := Reset(dev, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	command := strings.Join(dev.Commands, "\n")
+	for _, removed := range []string{
+		remoteConfig,
+		remoteWallpaper,
+		remoteWallpapers + "/*.jpg",
+		remoteWallpapers + "/*.WEBP",
+	} {
+		if !strings.Contains(command, removed) {
+			t.Errorf("%s is not removed: %s", removed, command)
+		}
+	}
+}
+
+func TestRestartComesBackAsHomeAndRebindsTheKeyServices(t *testing.T) {
+	restart := restartHomeKeepingAccessibility
+	whenHome := strings.Index(restart, tv.Launcher+"/*) "+tv.StartHome)
+	otherwise := strings.Index(restart, "*) am start -n "+tv.LauncherActivity)
+	if whenHome < 0 || otherwise < whenHome {
+		t.Errorf("Home is not restarted through the Home intent: %s", restart)
+	}
+
+	firstWrite := strings.Index(restart, writeServicesBack)
+	switchOff := strings.Index(restart, switchServicesOff)
+	lastWrite := strings.LastIndex(restart, writeServicesBack)
+	if firstWrite < 0 || switchOff < firstWrite || lastWrite < switchOff {
+		t.Errorf("write back, switch off, write back again: %s", restart)
+	}
+}

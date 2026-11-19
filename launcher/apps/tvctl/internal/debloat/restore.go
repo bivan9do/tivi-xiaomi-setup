@@ -1,0 +1,243 @@
+package debloat
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/kienmai160598/freeTV/apps/tvctl/internal/tv"
+)
+
+const listDisabledPackages = "pm list packages -d"
+
+const homeStaysWithLauncherNotice = "  Home goes back to %[1]s, which owned it when the " +
+	"record was taken: %[2]s was %[3]s then, so it stays as it is.\n" +
+	"  To have it back: scripts/tvctl shell 'pm enable %[2]s', then make it Home.\n"
+
+const homeLeftAloneNotice = "  leaving Home alone: none was recorded, and %s was %s when the " +
+	"record was taken\n"
+
+const otherRecordsExist = "no recovery record for this list at %s, " +
+	"but this TV has others:\n  %s\n" +
+	"pass the one taken for this list with --record"
+
+const sameListUnderOtherAddress = "a recovery record for this same list is under " +
+	"another address: %s\n"
+
+const sameListUnderOtherAddressAdvice = "If this is that TV on a new address (a new DHCP " +
+	"lease, or the Wi-Fi forget and re-join the setupwraith step asks for), stop and run\n" +
+	"  scripts/tvctl restore --record <that file> <list>\n" +
+	"instead: this run otherwise enables packages that were off before cleanup.\n" +
+	"If this is a second TV cleaned with the same list, nothing is wrong: that record is " +
+	"the other TV's.\n"
+
+func RestoreCommands(recordPath, listPath, stock string, warn io.Writer) ([]string, error) {
+	names, err := ReadList(listPath)
+	if err != nil {
+		return nil, err
+	}
+
+	stock, err = validStockLauncher(stock)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := os.Stat(recordPath); err != nil {
+		return commandsWithoutRecord(recordPath, names, stock, warn)
+	}
+
+	record, err := LoadRecord(recordPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return commandsFromRecord(record, names, stock, warn), nil
+}
+
+func Restore(dev tv.Device, commands []string, out, warn io.Writer) error {
+	if err := tv.Batch(dev, commands, out); err != nil {
+		return err
+	}
+
+	fmt.Fprint(warn, tv.RebootDelayNotice)
+	return nil
+}
+
+func validStockLauncher(stock string) (string, error) {
+	if stock == "" {
+		return tv.StockLauncher, nil
+	}
+
+	if !tv.PackageName.MatchString(stock) {
+		return "", fmt.Errorf("not a package name: %q", stock)
+	}
+
+	return stock, nil
+}
+
+func commandsFromRecord(record *Record, names []string, stock string, warn io.Writer) []string {
+	enabled := packagesToEnable(record, warn)
+	commands := enableCommands(enabled)
+	commands = append(commands, homeCommands(record, stock, warn)...)
+	commands = append(commands, animationScaleCommands(record, warn)...)
+	if added := record.missing(names); len(added) > 0 {
+		fmt.Fprintf(warn, "not in the record, leaving alone: %s\n", strings.Join(added, ", "))
+	}
+
+	leftAlone := len(record.Packages) - len(enabled)
+	fmt.Fprintf(warn, "restoring the state recorded on %s: "+
+		"re-enabling %d, leaving %d as they were.\n",
+		record.Created, len(enabled), leftAlone)
+	return append(commands, listDisabledPackages)
+}
+
+func packagesToEnable(record *Record, warn io.Writer) []string {
+	names := make([]string, 0, len(record.Packages))
+	for name := range record.Packages {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+	var enabled []string
+	for _, name := range names {
+		if state := record.Packages[name]; state != stateEnabled {
+			fmt.Fprintf(warn, "  leaving %s alone (%s when the record was taken)\n", name, state)
+			continue
+		}
+		enabled = append(enabled, name)
+	}
+
+	return enabled
+}
+
+func enableCommands(names []string) []string {
+	commands := make([]string, 0, len(names))
+	for _, name := range names {
+		commands = append(commands, "pm enable "+name)
+	}
+
+	return commands
+}
+
+func homeCommands(record *Record, stock string, warn io.Writer) []string {
+	stockState := record.Packages[stock]
+	switch {
+	case record.Home != nil && tv.PackageOf(*record.Home) != tv.Launcher:
+		return []string{setRecordedHome(record)}
+	case record.Home != nil && stockState != stateEnabled:
+		fmt.Fprintf(warn, homeStaysWithLauncherNotice, *record.Home, stock, stateThen(stockState))
+		return []string{setRecordedHome(record)}
+	case record.Home == nil && (stockState == stateDisabled || stockState == stateAbsent):
+		fmt.Fprintf(warn, homeLeftAloneNotice, stock, stockState)
+		return nil
+	default:
+		return []string{tv.SetHomeTo(stock)}
+	}
+}
+
+func setRecordedHome(record *Record) string {
+	return "cmd package set-home-activity --user 0 " + *record.Home
+}
+
+func stateThen(state string) string {
+	if state == "" {
+		return "not in the record"
+	}
+
+	return state
+}
+
+func animationScaleCommands(record *Record, warn io.Writer) []string {
+	var commands []string
+	for _, key := range AnimationScales {
+		value := recordedSetting(record, key)
+		switch {
+		case value == "null":
+			commands = append(commands, "settings delete global "+key)
+		case scaleValue.MatchString(value):
+			commands = append(commands, fmt.Sprintf("settings put global %s %s", key, value))
+		default:
+			fmt.Fprintf(warn, "  skipping %s: the record holds %q, not a number\n", key, value)
+		}
+	}
+
+	return commands
+}
+
+func recordedSetting(record *Record, key string) string {
+	value, ok := record.Settings[key]
+	if !ok || value == nil {
+		return ""
+	}
+
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func commandsWithoutRecord(
+	recordPath string,
+	names []string,
+	stock string,
+	warn io.Writer,
+) ([]string, error) {
+	if others := otherRecordsForSameTV(recordPath); len(others) > 0 {
+		return nil, fmt.Errorf(otherRecordsExist, recordPath, strings.Join(others, "\n  "))
+	}
+
+	warnAboutSameListUnderOtherAddresses(recordPath, warn)
+	fmt.Fprintf(warn, "no recovery record for this TV and list (%s).\n"+
+		"Enabling every listed package and resetting Home and the animation scales to their\n"+
+		"defaults. Packages that were already disabled before cleanup will be enabled too:\n"+
+		"check the list before running this.\n", recordPath)
+	commands := enableCommands(names)
+	commands = append(commands, "pm enable "+stock, tv.SetHomeTo(stock))
+	for _, key := range AnimationScales {
+		commands = append(commands, "settings put global "+key+" 1.0")
+	}
+
+	return append(commands, listDisabledPackages), nil
+}
+
+func warnAboutSameListUnderOtherAddresses(recordPath string, warn io.Writer) {
+	others := sameListUnderOtherAddresses(recordPath)
+	for _, other := range others {
+		fmt.Fprintf(warn, sameListUnderOtherAddress, other)
+	}
+
+	if len(others) > 0 {
+		fmt.Fprint(warn, sameListUnderOtherAddressAdvice)
+	}
+}
+
+func sameListUnderOtherAddresses(recordPath string) []string {
+	fileName := filepath.Base(recordPath)
+	listSuffix := fileName[strings.LastIndex(fileName, "-"):]
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(recordPath), "recovery-*"+listSuffix))
+	var others []string
+	for _, match := range matches {
+		if match != recordPath {
+			others = append(others, match)
+		}
+	}
+
+	return others
+}
+
+func otherRecordsForSameTV(recordPath string) []string {
+	fileName := filepath.Base(recordPath)
+	hostPrefix := fileName[:strings.LastIndex(fileName, "-")+1]
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(recordPath), hostPrefix+"*.json"))
+	var others []string
+	for _, match := range matches {
+		record, err := LoadRecord(match)
+		if err != nil {
+			others = append(others, match)
+			continue
+		}
+		others = append(others, fmt.Sprintf("%s (list %s, %s)", match, record.List, record.Created))
+	}
+
+	return others
+}

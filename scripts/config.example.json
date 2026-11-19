@@ -1,0 +1,23 @@
+{
+    "dock_apps":  [
+
+                  ],
+    "hidden_apps":  [
+                        "com.mediatek.wwtv.tvcenter",
+                        "com.mitv.gallery",
+                        "com.ravikwow.startsettings",
+                        "org.liskovsoft.androidtv.rukeyboard",
+                        "com.google.android.katniss",
+                        "com.dinhlap.hometv",
+                        "com.tieume.launchpadtv",
+                        "com.mitv.launchpad.waker"
+                    ],
+    "columns":  6,
+    "rows_below_dock":  1,
+    "greeting_name":  "Tên của bạn",
+    "wallpaper":  true,
+    "wallpaper_dim":  0,
+    "app_library":  true,
+    "dock_row":  true,
+    "fill_dock":  false
+}

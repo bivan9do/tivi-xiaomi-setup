@@ -1,0 +1,14 @@
+.DS_Store
+backup/
+local/
+
+apps/tvctl/bin/
+
+apps/launcher/.gradle/
+apps/launcher/build/
+apps/launcher/app/build/
+apps/launcher/local.properties
+apps/launcher/hs_err_pid*.log
+apps/launcher/replay_pid*.log
+*.apk
+*.aab
